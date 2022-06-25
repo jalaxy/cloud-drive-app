@@ -9,11 +9,21 @@ create table `sessions` (
     primary key (`sessionid`)
 );
 
+create table `invcode` (
+    `invcode` char(8) not null,
+    `maxnum` int default 10,
+    primary key (`invcode`)
+);
+
 create table `user` (
     `userid` char(16) not null,
     `username` char(16) not null unique,
     `passwd` varchar(64) not null,
-    primary key (`userid`)
+    `invcode` char(8) not null,
+    primary key (`userid`),
+    constraint fk_user_invcode
+        foreign key (`invcode`) references `invcode`(`invcode`)
+        on delete cascade on update cascade
 );
 
 create table `last` (
@@ -27,6 +37,7 @@ create table `last` (
 create table `login` (
     `sessionid` varchar(128) not null,
     `userid` char(16) not null,
+    primary key (`sessionid`),
     constraint fk_login_user
         foreign key (`userid`) references `user`(`userid`)
         on delete cascade on update cascade
@@ -59,4 +70,6 @@ begin
 end-;
 delimiter ;
 
-insert into `user`(`username`, `passwd`) values('test', sha2('123', 256));
+insert into `invcode` values ('00000000', 2);
+-- insert into `user`(`username`, `passwd`, `invcode`) values('test', sha2('123', 256), '00000000');
+insert into `user`(`username`, `passwd`, `invcode`) values('test', '123', '00000000');

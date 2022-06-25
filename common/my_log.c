@@ -39,3 +39,10 @@ int print_time()
     printf("%04d-%02d-%02d %02d:%02d:%02d.%03d",
            year, month + 1, day + 1, hour, minute, second, millisecond);
 }
+
+int epoch_time()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec;
+}

@@ -1,5 +1,6 @@
 #include <my_log.h>
 #include <unistd.h>
+#include <cstring>
 #include <errno.h>
 #include <my_args.h>
 #include <my_daemon.h>
@@ -10,7 +11,13 @@
 #include <mysql.h>
 
 #define SOCK_BUF_SZ (1024 * 16)
-#define FILE_BUF_SZ (1024 * 1024)
+#define MSG_BUF_SZ (1024 * 1024)
+
+#define MSG_NOUSER "User does not exist."
+#define MSG_WPSWD "Incorrect password."
+#define MSG_SUC "Success."
+#define MSG_WINV "Invalid invitation code."
+#define MSG_UEXST "User already exists."
 
 typedef struct struct_sock_list
 {
@@ -20,8 +27,8 @@ typedef struct struct_sock_list
 
 typedef struct struct_write_queue
 {
-    int offset, size;
-    char buf[FILE_BUF_SZ];
+    int size;
+    char buf[MSG_BUF_SZ];
     sock_inet_base *sock; // destination socket
     struct struct_write_queue *next;
 } write_queue_t;
@@ -41,24 +48,128 @@ void logonclose(const char *logname, sock_inet_base *p)
             p->get_count_recv(), p->get_count_send());
 }
 
-void processincoming(const char *logname, MYSQL *mysql, const char *buf)
+MYSQL_RES *create_query_result(const char *logname, MYSQL *mysql, const char *query, bool create)
 {
-    MYSQL_RES *result;
-    MYSQL_ROW row;
-    if (mysql_query(mysql, "select * from user"))
+    MYSQL_RES *result = NULL;
+    if (mysql_query(mysql, query))
     {
         LOGTIME(logname, "mysql_query failed(%s)\n", mysql_error(mysql));
-        return;
+        return NULL;
     }
-    if (!(result = mysql_store_result(mysql)))
-    {
+    if (create && !(result = mysql_store_result(mysql)))
         LOGTIME(logname, "mysql_store_result failed\n");
-        return;
+    return result;
+}
+
+const char *newsid(const char *logname, MYSQL *mysql, char *sid)
+{
+    char q[256] = {0};
+    while (true)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            sid[i] = rand() % 16;
+            sid[i] += sid[i] < 10 ? '0' : 'a' - 10;
+        }
+        sid[32] = 0;
+        sprintf(q, "select count(*) from `sessions` where `sessionid` = '%s'", sid);
+        MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+        bool exists = strcmp(mysql_fetch_row(res)[0], "0") != 0;
+        mysql_free_result(res);
+        if (!exists)
+            break;
     }
-    LOGTIME(logname, "select return %d records\n", (int)mysql_num_rows(result));
-    while ((row = mysql_fetch_row(result)) != NULL)
-        LOGTIME(logname, "%s\n%s\n%s\n", row[0], row[1], row[2]);
-    mysql_free_result(result);
+    sprintf(q, "insert into `sessions` values('%.128s', %d, null);",
+            sid, epoch_time() + SECS_PER_DAY);
+    create_query_result(logname, mysql, q, false);
+    return sid;
+}
+
+void processincoming(
+    const char *logname, MYSQL *mysql, const char *raw,
+    write_queue_t *rear, sock_inet_base *sock)
+{
+    if (strncmp(raw, "login", strlen("login")) == 0)
+    {
+        const char *username = raw + 16, *passwd = raw + 80;
+        rear = rear->next = new write_queue_t;
+        rear->sock = sock;
+        rear->next = NULL;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        char q[128] = {0};
+        sprintf(q, "select `userid`, `passwd` from user where `username` = '%.64s';", username);
+        MYSQL_RES *result = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (!row)
+        {
+            rear->size = 144;
+            memcpy(rear->buf, "message", strlen("message"));
+            memcpy(rear->buf + 16, MSG_NOUSER, strlen(MSG_NOUSER));
+        }
+        else if (strncmp(row[1], passwd, 64) == 0)
+        {
+            char sid[129];
+            rear->size = 144;
+            memcpy(rear->buf, "login", strlen("login"));
+            memcpy(rear->buf + 16, newsid(logname, mysql, sid), 128);
+            char qinsert[128] = {0};
+            sprintf(qinsert, "insert into `login` values('%.128s', '%.16s');", sid, row[0]);
+            create_query_result(logname, mysql, qinsert, false);
+        }
+        else
+        {
+            rear->size = 144;
+            memcpy(rear->buf, "message", strlen("message"));
+            memcpy(rear->buf + 16, MSG_WPSWD, strlen(MSG_WPSWD));
+        }
+        mysql_free_result(result);
+    }
+    else if (strncmp(raw, "register", strlen("register")) == 0)
+    {
+        const char *username = raw + 16, *passwd = raw + 80, *invcode = raw + 144;
+        rear = rear->next = new write_queue_t;
+        rear->sock = sock;
+        rear->next = NULL;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        char q[128] = {0};
+        sprintf(q, "select count(*), maxnum from `invcode` natural join `user` where `invcode` = '%.8s'",
+                invcode);
+        MYSQL_RES *result = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (row && strtol(row[0], NULL, 10) < strtol(row[1], NULL, 10))
+        {
+            rear->size = 144;
+            char qinsert[128] = {0};
+            sprintf(qinsert, "select username from user where `username` = '%.64s';", username);
+            MYSQL_RES *rinsert = create_query_result(logname, mysql, qinsert, true);
+            if (mysql_fetch_row(rinsert))
+            {
+                rear->size = 144;
+                memcpy(rear->buf, "message", strlen("message"));
+                memcpy(rear->buf + 16, MSG_UEXST, strlen(MSG_UEXST));
+            }
+            else
+            {
+                sprintf(qinsert, "insert into `user`(`username`, `passwd`, `invcode`) \
+                    values ('%s', '%s', '%s');",
+                        username, passwd, invcode);
+                create_query_result(logname, mysql, qinsert, false);
+                memcpy(rear->buf, "register", strlen("register"));
+                memcpy(rear->buf + 16, MSG_SUC, strlen(MSG_SUC));
+            }
+            mysql_free_result(rinsert);
+        }
+        else
+        {
+            rear->size = 144;
+            memcpy(rear->buf, "message", strlen("message"));
+            memcpy(rear->buf + 16, MSG_WINV, strlen(MSG_WINV));
+        }
+        mysql_free_result(result);
+    }
+    else if (strncmp(raw, "upload", strlen("upload")) == 0)
+    {
+    }
 }
 
 int main(int argc, char *argv[])
@@ -104,7 +215,7 @@ int main(int argc, char *argv[])
 
     // socket list and buffer queue initialization
     sock_list_t head = {NULL, NULL};
-    write_queue_t front = {0, 0, {0}, NULL, NULL}, *rear = &front;
+    write_queue_t front = {0, {0}, NULL, NULL}, *rear = &front;
 
     // signals
     exit_signal = false; // exit_signal is set after receiving SIGINT or SIGTERM
@@ -154,13 +265,23 @@ int main(int argc, char *argv[])
                     char buf[SOCK_BUF_SZ];
                     int size;
                     IGNORE_ERR(size = p->sock->recv_data(buf, SOCK_BUF_SZ));
-                    processincoming(logname, mysql, buf);
-                    if (size <= 0)
+                    if (size > 0)
+                        processincoming(logname, mysql, buf, rear, p->sock);
+                    else
                     {
                         // connection is closed by any side of connection
                         pre->next = p->next;
                         p->sock->set_epoll(epfd, EPOLL_CTL_DEL);
                         logonclose(logname, p->sock);
+                        for (write_queue_t *pre = &front; pre && pre->next; pre = pre->next)
+                            if (pre->next->sock == p->sock)
+                            {
+                                if (rear == pre->next)
+                                    rear = pre; // update rear_q if removing the last node
+                                write_queue_t *p = pre->next;
+                                pre->next = p->next;
+                                delete p;
+                            }
                         delete p->sock;
                         delete p;
                     }
