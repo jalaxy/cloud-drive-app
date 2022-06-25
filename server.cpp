@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <new>
 #include <mysql.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
 #define SOCK_BUF_SZ (1024 * 16)
 #define MSG_BUF_SZ (1024 * 1024)
@@ -18,6 +20,8 @@
 #define MSG_SUC "Success."
 #define MSG_WINV "Invalid invitation code."
 #define MSG_UEXST "User already exists."
+#define MSG_NFILE "File not found."
+#define MSG_NSESS "Session not found."
 
 typedef struct struct_sock_list
 {
@@ -85,8 +89,19 @@ const char *newsid(const char *logname, MYSQL *mysql, char *sid)
     return sid;
 }
 
+void sha512sum(const char *path, char *res)
+{
+    char *cmd = new (std::nothrow) char[snprintf(NULL, 0, "sha512sum %s", path) + 1];
+    sprintf(cmd, "sha512sum %s", path);
+    FILE *fp = popen(cmd, "r");
+    fscanf(fp, "%s", res);
+    pclose(fp);
+    delete[] cmd;
+}
+
 void processincoming(
-    const char *logname, MYSQL *mysql, const char *raw,
+    const char *logname, const char *rootpath,
+    MYSQL *mysql, const char *raw,
     write_queue_t *rear, sock_inet_base *sock)
 {
     if (strncmp(raw, "login", strlen("login")) == 0)
@@ -170,26 +185,109 @@ void processincoming(
     else if (strncmp(raw, "upload", strlen("upload")) == 0)
     {
     }
+    else if (strncmp(raw, "download", strlen("download")) == 0)
+    {
+        rear = rear->next = new write_queue_t;
+        rear->sock = sock;
+        rear->next = NULL;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        const char *sid = raw + 16, *pathlenstr = raw + 144, *path = raw + 160;
+        const int pathlen = strtol(pathlenstr, NULL, 10);
+        char q[256] = {0};
+        sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
+        MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (row)
+        {
+            const char *uid = row[0];
+            int fullpathlen = snprintf(NULL, 0, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            char *fullpath = new (std::nothrow) char[fullpathlen + 1];
+            snprintf(fullpath, fullpathlen + 1, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            char *rpath = realpath(fullpath, NULL);
+            if (rpath) // file or directory exist
+            {
+                struct stat statbuf;
+                stat(rpath, &statbuf);
+                rear->size = 160;
+                memcpy(rear->buf, "download", strlen("download"));
+                if (S_ISDIR(statbuf.st_mode))
+                {
+                    // create a information file in rootpath/d/
+                    int infopathlen = snprintf(NULL, 0, "%s/d/new", rootpath);
+                    char *infopath = new (std::nothrow) char[infopathlen + 1];
+                    snprintf(infopath, infopathlen + 1, "%s/d/new", rootpath);
+                    FILE *fp = fopen(infopath, "w");
+                    DIR *dirp = opendir(rpath);
+                    struct dirent *dir;
+                    while (dir = readdir(dirp))
+                    {
+                        int subpathlen = snprintf(NULL, 0, "%s/%s", rpath, dir->d_name);
+                        char *subpath = new (std::nothrow) char[subpathlen + 1];
+                        snprintf(subpath, subpathlen + 1, "%s/%s", rpath, dir->d_name);
+                        stat(subpath, &statbuf);
+                        fprintf(fp, "%s %s %d\n", dir->d_name,
+                                S_ISDIR(statbuf.st_mode) ? "d" : "r", statbuf.st_size);
+                        delete[] subpath;
+                    }
+                    closedir(dirp);
+                    fclose(fp);
+                    char sha512name[129];
+                    sha512sum(infopath, sha512name);
+                    int newpathlen = snprintf(NULL, 0, "%s/d/%s", rootpath, sha512name);
+                    char *newpath = new (std::nothrow) char[newpathlen + 1];
+                    snprintf(newpath, newpathlen + 1, "%s/d/%s", rootpath, sha512name);
+                    rename(infopath, newpath);
+                    stat(newpath, &statbuf);
+                    memcpy(rear->buf + 16, sha512name, 128);
+                    delete[] infopath;
+                    delete[] newpath;
+                }
+                else
+                {
+                    const char *name = basename(rpath);
+                    memcpy(rear->buf + 16, name, strlen(name));
+                }
+                snprintf(rear->buf + 144, 16, "%d", statbuf.st_size);
+                free(rpath);
+            }
+            else // file not found
+            {
+                rear->size = 144;
+                memcpy(rear->buf, "message", strlen("message"));
+                memcpy(rear->buf + 16, MSG_NFILE, strlen(MSG_NFILE));
+            }
+            delete[] fullpath;
+        }
+        else // session not found
+        {
+            rear->size = 144;
+            memcpy(rear->buf, "message", strlen("message"));
+            memcpy(rear->buf + 16, MSG_NSESS, strlen(MSG_NSESS));
+        }
+        mysql_free_result(res);
+    }
 }
 
 int main(int argc, char *argv[])
 {
     // process arguments
-    const char *options[] = {"--daemon", "--port", "--logname", "--help"};
-    int idx[4];
-    my_args(argc, argv, 4, options, idx);
+    const char *options[] = {"--daemon", "--port", "--logname", "--rootpath", "--help"};
+    int idx[5];
+    my_args(argc, argv, 5, options, idx);
     bool daemon = arg_exist(argc, argv, idx[0]);
     int port = arg_int32(argc, argv, idx[1] + 1);
     char *logname = arg_str(argc, argv, idx[2] + 1);
-    bool info = arg_exist(argc, argv, idx[3]);
-    if (port & 0xffff0000)
+    char *rootpath = arg_str(argc, argv, idx[3] + 1);
+    bool info = arg_exist(argc, argv, idx[4]);
+    if (port & 0xffff0000 || rootpath == NULL)
         fprintf(stderr, "Invalid argument.\n"), info = true;
     if (info)
     {
         printf("A simple cloud drive server. Arguments:\n");
         printf("    --daemon       Run as daemon.\n");
         printf("    --port PORT    Listen on port PORT.\n");
-        printf("    --logname s    Store log in the path s.\n");
+        printf("    --logname S    Store log in the path S.\n");
+        printf("    --rootpath P   Specify file root P.\n");
         printf("    --help         Show information.\n");
         return 0;
     }
@@ -266,7 +364,7 @@ int main(int argc, char *argv[])
                     int size;
                     IGNORE_ERR(size = p->sock->recv_data(buf, SOCK_BUF_SZ));
                     if (size > 0)
-                        processincoming(logname, mysql, buf, rear, p->sock);
+                        processincoming(logname, rootpath, mysql, buf, rear, p->sock);
                     else
                     {
                         // connection is closed by any side of connection
