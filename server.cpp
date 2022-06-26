@@ -17,11 +17,14 @@
 
 #define MSG_NOUSER "User does not exist."
 #define MSG_WPSWD "Incorrect password."
-#define MSG_SUC "Success."
 #define MSG_WINV "Invalid invitation code."
 #define MSG_UEXST "User already exists."
 #define MSG_NFILE "File not found."
 #define MSG_NSESS "Session not found."
+#define MSG_UNREC "Unrecognizable data format."
+#define MSG_TOOLRG "Request exceeds size limits"
+
+#define STR_EQ(s, sref) (strncmp(s, sref, strlen(sref)) == 0)
 
 typedef struct struct_sock_list
 {
@@ -99,14 +102,22 @@ void sha512sum(const char *path, char *res)
     delete[] cmd;
 }
 
-void processincoming(
+int construct_msg(write_queue_t *p, const char *msg)
+{
+    p->size = 144;
+    memcpy(p->buf, "message", strlen("message"));
+    memcpy(p->buf + 16, msg, strlen(msg));
+    return 0;
+}
+
+int processincoming(
     const char *logname, const char *rootpath,
     MYSQL *mysql, const char *raw,
     write_queue_t *rear, sock_inet_base *sock)
 {
-    if (strncmp(raw, "login", strlen("login")) == 0)
+    if (STR_EQ(raw, "login"))
     {
-        const char *username = raw + 16, *passwd = raw + 80;
+        const char *username = raw + 16, *passwd = username + 64;
         rear = rear->next = new write_queue_t;
         rear->sock = sock;
         rear->next = NULL;
@@ -116,12 +127,10 @@ void processincoming(
         MYSQL_RES *result = create_query_result(logname, mysql, q, true);
         MYSQL_ROW row = mysql_fetch_row(result);
         if (!row)
-        {
-            rear->size = 144;
-            memcpy(rear->buf, "message", strlen("message"));
-            memcpy(rear->buf + 16, MSG_NOUSER, strlen(MSG_NOUSER));
-        }
-        else if (strncmp(row[1], passwd, 64) == 0)
+            construct_msg(rear, MSG_NOUSER);
+        else if (strncmp(row[1], passwd, 64) != 0)
+            construct_msg(rear, MSG_WPSWD);
+        else
         {
             char sid[129];
             rear->size = 144;
@@ -131,17 +140,11 @@ void processincoming(
             sprintf(qinsert, "insert into `login` values('%.128s', '%.16s');", sid, row[0]);
             create_query_result(logname, mysql, qinsert, false);
         }
-        else
-        {
-            rear->size = 144;
-            memcpy(rear->buf, "message", strlen("message"));
-            memcpy(rear->buf + 16, MSG_WPSWD, strlen(MSG_WPSWD));
-        }
         mysql_free_result(result);
     }
-    else if (strncmp(raw, "register", strlen("register")) == 0)
+    else if (STR_EQ(raw, "register"))
     {
-        const char *username = raw + 16, *passwd = raw + 80, *invcode = raw + 144;
+        const char *username = raw + 16, *passwd = username + 64, *invcode = passwd + 64;
         rear = rear->next = new write_queue_t;
         rear->sock = sock;
         rear->next = NULL;
@@ -158,11 +161,7 @@ void processincoming(
             sprintf(qinsert, "select username from user where `username` = '%.64s';", username);
             MYSQL_RES *rinsert = create_query_result(logname, mysql, qinsert, true);
             if (mysql_fetch_row(rinsert))
-            {
-                rear->size = 144;
-                memcpy(rear->buf, "message", strlen("message"));
-                memcpy(rear->buf + 16, MSG_UEXST, strlen(MSG_UEXST));
-            }
+                construct_msg(rear, MSG_UEXST);
             else
             {
                 sprintf(qinsert, "insert into `user`(`username`, `passwd`, `invcode`) \
@@ -170,28 +169,23 @@ void processincoming(
                         username, passwd, invcode);
                 create_query_result(logname, mysql, qinsert, false);
                 memcpy(rear->buf, "register", strlen("register"));
-                memcpy(rear->buf + 16, MSG_SUC, strlen(MSG_SUC));
+                memcpy(rear->buf + 16, "Success.", strlen("Success."));
             }
             mysql_free_result(rinsert);
         }
         else
-        {
-            rear->size = 144;
-            memcpy(rear->buf, "message", strlen("message"));
-            memcpy(rear->buf + 16, MSG_WINV, strlen(MSG_WINV));
-        }
+            construct_msg(rear, MSG_WINV);
         mysql_free_result(result);
     }
-    else if (strncmp(raw, "upload", strlen("upload")) == 0)
-    {
-    }
-    else if (strncmp(raw, "download", strlen("download")) == 0)
+    else if (STR_EQ(raw, "download"))
     {
         rear = rear->next = new write_queue_t;
         rear->sock = sock;
         rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
-        const char *sid = raw + 16, *pathlenstr = raw + 144, *path = raw + 160;
+        const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
+        if (pathlenstr[15] || pathlenstr[0] > '9' || pathlenstr[0] < '0')
+            return construct_msg(rear, MSG_UNREC);
         const int pathlen = strtol(pathlenstr, NULL, 10);
         char q[256] = {0};
         sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
@@ -251,21 +245,53 @@ void processincoming(
                 free(rpath);
             }
             else // file not found
-            {
-                rear->size = 144;
-                memcpy(rear->buf, "message", strlen("message"));
-                memcpy(rear->buf + 16, MSG_NFILE, strlen(MSG_NFILE));
-            }
+                construct_msg(rear, MSG_NFILE);
             delete[] fullpath;
         }
         else // session not found
-        {
-            rear->size = 144;
-            memcpy(rear->buf, "message", strlen("message"));
-            memcpy(rear->buf + 16, MSG_NSESS, strlen(MSG_NSESS));
-        }
+            construct_msg(rear, MSG_NSESS);
         mysql_free_result(res);
     }
+    else if (STR_EQ(raw, "downdata"))
+    {
+        const char *sha = raw + 16, *off_str = sha + 128, *len_str = off_str + 16;
+        rear = rear->next = new write_queue_t;
+        rear->sock = sock;
+        rear->next = NULL;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        if (off_str[15] || off_str[0] > '9' || off_str[0] < '0' ||
+            len_str[15] || len_str[0] > '9' || off_str[0] < '0')
+            return construct_msg(rear, MSG_UNREC);
+        const int offset = strtol(off_str, NULL, 10), len = strtol(len_str, NULL, 10);
+        rear->size = 16 + len;
+        if (rear->size > MSG_BUF_SZ)
+            return construct_msg(rear, MSG_TOOLRG);
+        int l = snprintf(NULL, 0, "%s/d/%.128s", rootpath, sha);
+        char *fullpath = new (std::nothrow) char[l + 1];
+        snprintf(fullpath, l + 1, "%s/d/%.128s", rootpath, sha);
+        if (access(fullpath, R_OK) == 0 ||
+            access((fullpath[strlen(rootpath) + 1] = 'r', fullpath), R_OK) == 0)
+        {
+            rear->size = 16 + len;
+            memcpy(rear->buf, "downdata", strlen("downdata"));
+            FILE *fp = fopen(fullpath, "r");
+            fseek(fp, offset, SEEK_SET);
+            fread(rear->buf + 16, 1, len, fp);
+            fclose(fp);
+        }
+        else
+            construct_msg(rear, MSG_NFILE);
+        delete[] fullpath;
+    }
+    else
+    {
+        rear = rear->next = new write_queue_t;
+        rear->sock = sock;
+        rear->next = NULL;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        construct_msg(rear, MSG_UNREC);
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[])
