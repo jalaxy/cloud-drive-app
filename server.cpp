@@ -399,7 +399,7 @@ int processincoming(
                     sha, b, e);
             MYSQL_RES *res = create_query_result(logname, mysql, q, true);
             if (mysql_fetch_row(res) == NULL)
-                return construct_msg(rear, MSG_NUPLD);
+                return mysql_free_result(res), construct_msg(rear, MSG_NUPLD);
             mysql_free_result(res);
             int l = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
             char *fullpath = new (std::nothrow) char[l + 1];
@@ -408,59 +408,14 @@ int processincoming(
             fseek(fp, offset, SEEK_SET);
             fwrite(data, 1, len, fp);
             fclose(fp);
-            size_t newb = b, newe = e;
-            while (true)
-            {
-                sprintf(q, "select `begin`, `end` from `upload` where \
-                    `fileid` = '%.128s' and `begin` < %llu and `end` >= %llu and `status` = 'done'",
-                        sha, newb, newb - 1);
-                MYSQL_RES *res = create_query_result(logname, mysql, q, true);
-                MYSQL_ROW row = mysql_fetch_row(res);
-                if (row)
-                {
-                    size_t leftb = strtoull(row[0], NULL, 10), lefte = strtoull(row[1], NULL, 10);
-                    sprintf(q, "delete from `upload` where \
-                        `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
-                            sha, leftb, lefte);
-                    create_query_result(logname, mysql, q, false);
-                    newb = leftb;
-                }
-                else
-                    break;
-                mysql_free_result(res);
-            }
-            while (true)
-            {
-                sprintf(q, "select `begin`, `end` from `upload` where \
-                    `fileid` = '%.128s' and `begin` <= %llu and `end` > %llu and `status` = 'done'",
-                        sha, newe + 1, newe);
-                MYSQL_RES *res = create_query_result(logname, mysql, q, true);
-                MYSQL_ROW row = mysql_fetch_row(res);
-                if (row)
-                {
-                    size_t rightb = strtoull(row[0], NULL, 10), righte = strtoull(row[1], NULL, 10);
-                    sprintf(q, "delete from `upload` where \
-                        `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
-                            sha, rightb, righte);
-                    create_query_result(logname, mysql, q, false);
-                    newe = righte;
-                }
-                else
-                    break;
-                mysql_free_result(res);
-            }
-            sprintf(q, "update `upload` set `status` = 'done', `begin` = %llu, `end` = %llu \
-                where `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
-                    newb, newe, sha, b, e);
+            sprintf(q, "delete from `upload` where \
+                `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
+                    sha, b, e);
             create_query_result(logname, mysql, q, false);
             sprintf(q, "select `status` from `upload` where `fileid` = '%.128s'", sha);
             res = create_query_result(logname, mysql, q, true);
-            if (mysql_num_rows(res) == 1 && strcmp(mysql_fetch_row(res)[0], "done") == 0)
-            {
+            if (mysql_num_rows(res) == 0)
                 chmod(fullpath, 0644);
-                sprintf(q, "delete from `upload` where `fileid` = %.128s", sha);
-                create_query_result(logname, mysql, q, false);
-            }
             mysql_free_result(res);
             delete[] fullpath;
         }
@@ -469,10 +424,8 @@ int processincoming(
         int l = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
         char *fullpath = new (std::nothrow) char[l + 1];
         snprintf(fullpath, l + 1, "%s/r/%.128s", rootpath, sha);
-        if (mode_bits(fullpath) & S_IREAD)
-            memcpy(rear->buf + 16, "done", strlen("done"));
-        else
-            memcpy(rear->buf + 16, "pending", strlen("pending"));
+        bool readable = mode_bits(fullpath) & S_IREAD;
+        memcpy(rear->buf + 16, readable ? "done" : "pending", strlen(readable ? "done" : "pending"));
         delete[] fullpath;
     }
     else

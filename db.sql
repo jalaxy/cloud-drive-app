@@ -51,8 +51,7 @@ create table `upload` (
     primary key (`fileid`, `begin`, `end`),
     check (`end` > `begin`),
     check (`status` = 'pending' or
-        `status` = 'uploading' or
-        `status` = 'done')
+        `status` = 'uploading')
 );
 
 delimiter -;
