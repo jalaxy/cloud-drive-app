@@ -22,7 +22,8 @@
 #define MSG_NFILE "File not found."
 #define MSG_NSESS "Session not found."
 #define MSG_UNREC "Unrecognizable data format."
-#define MSG_TOOLRG "Request exceeds size limits"
+#define MSG_TOOLRG "Request exceeds size limits."
+#define MSG_NUPLD "Unrequested upload data."
 
 #define STR_EQ(s, sref) (strncmp(s, sref, strlen(sref)) == 0)
 
@@ -110,6 +111,14 @@ int construct_msg(write_queue_t *p, const char *msg)
     return 0;
 }
 
+int mode_bits(const char *filepath)
+{
+    struct stat s;
+    if (stat(filepath, &s) == -1)
+        return -1;
+    return s.st_mode;
+}
+
 int processincoming(
     const char *logname, const char *rootpath,
     MYSQL *mysql, const char *raw,
@@ -118,9 +127,8 @@ int processincoming(
     if (STR_EQ(raw, "login"))
     {
         const char *username = raw + 16, *passwd = username + 64;
-        rear = rear->next = new write_queue_t;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = sock;
-        rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
         char q[128] = {0};
         sprintf(q, "select `userid`, `passwd` from user where `username` = '%.64s';", username);
@@ -145,9 +153,8 @@ int processincoming(
     else if (STR_EQ(raw, "register"))
     {
         const char *username = raw + 16, *passwd = username + 64, *invcode = passwd + 64;
-        rear = rear->next = new write_queue_t;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = sock;
-        rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
         char q[128] = {0};
         sprintf(q, "select count(*), maxnum from `invcode` natural join `user` where `invcode` = '%.8s'",
@@ -179,14 +186,13 @@ int processincoming(
     }
     else if (STR_EQ(raw, "download"))
     {
-        rear = rear->next = new write_queue_t;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = sock;
-        rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
         const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
         if (pathlenstr[15] || pathlenstr[0] > '9' || pathlenstr[0] < '0')
             return construct_msg(rear, MSG_UNREC);
-        const int pathlen = strtol(pathlenstr, NULL, 10);
+        const long pathlen = strtol(pathlenstr, NULL, 10);
         char q[256] = {0};
         sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
         MYSQL_RES *res = create_query_result(logname, mysql, q, true);
@@ -219,7 +225,7 @@ int processincoming(
                         char *subpath = new (std::nothrow) char[subpathlen + 1];
                         snprintf(subpath, subpathlen + 1, "%s/%s", rpath, dir->d_name);
                         stat(subpath, &statbuf);
-                        fprintf(fp, "%s %s %d\n", dir->d_name,
+                        fprintf(fp, "%s %s %llu\n", dir->d_name,
                                 S_ISDIR(statbuf.st_mode) ? "d" : "r", statbuf.st_size);
                         delete[] subpath;
                     }
@@ -241,7 +247,7 @@ int processincoming(
                     const char *name = basename(rpath);
                     memcpy(rear->buf + 16, name, strlen(name));
                 }
-                snprintf(rear->buf + 144, 16, "%d", statbuf.st_size);
+                snprintf(rear->buf + 144, 16, "%llu", statbuf.st_size);
                 free(rpath);
             }
             else // file not found
@@ -255,26 +261,25 @@ int processincoming(
     else if (STR_EQ(raw, "downdata"))
     {
         const char *sha = raw + 16, *off_str = sha + 128, *len_str = off_str + 16;
-        rear = rear->next = new write_queue_t;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = sock;
-        rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
         if (off_str[15] || off_str[0] > '9' || off_str[0] < '0' ||
-            len_str[15] || len_str[0] > '9' || off_str[0] < '0')
+            len_str[15] || len_str[0] > '9' || len_str[0] < '0')
             return construct_msg(rear, MSG_UNREC);
-        const int offset = strtol(off_str, NULL, 10), len = strtol(len_str, NULL, 10);
+        const size_t offset = strtoull(off_str, NULL, 10), len = strtoull(len_str, NULL, 10);
         rear->size = 16 + len;
         if (rear->size > MSG_BUF_SZ)
             return construct_msg(rear, MSG_TOOLRG);
         int l = snprintf(NULL, 0, "%s/d/%.128s", rootpath, sha);
         char *fullpath = new (std::nothrow) char[l + 1];
         snprintf(fullpath, l + 1, "%s/d/%.128s", rootpath, sha);
-        if (access(fullpath, R_OK) == 0 ||
-            access((fullpath[strlen(rootpath) + 1] = 'r', fullpath), R_OK) == 0)
+        if (mode_bits(fullpath) & S_IREAD ||
+            mode_bits((fullpath[strlen(rootpath) + 1] = 'r', fullpath)) & S_IREAD)
         {
             rear->size = 16 + len;
             memcpy(rear->buf, "downdata", strlen("downdata"));
-            FILE *fp = fopen(fullpath, "r");
+            FILE *fp = fopen(fullpath, "rb");
             fseek(fp, offset, SEEK_SET);
             fread(rear->buf + 16, 1, len, fp);
             fclose(fp);
@@ -283,11 +288,197 @@ int processincoming(
             construct_msg(rear, MSG_NFILE);
         delete[] fullpath;
     }
+    else if (STR_EQ(raw, "upload"))
+    {
+        const char *sid = raw + 16, *sha = sid + 128, *filesz_str = sha + 128,
+                   *pathlen_str = filesz_str + 16, *path = pathlen_str + 16;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        if (filesz_str[15] || filesz_str[0] > '9' || filesz_str[0] < '0' ||
+            pathlen_str[15] || pathlen_str[0] > '9' || pathlen_str[0] < '0')
+            return construct_msg(rear, MSG_UNREC);
+        const size_t filesz = strtoull(filesz_str, NULL, 10), pathlen = strtoull(pathlen_str, NULL, 10);
+        char q[256] = {0};
+        sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
+        MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (row)
+        {
+            const char *uid = row[0];
+            int fullpathlen = snprintf(NULL, 0, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            int rpathlen = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
+            char *fullpath = new (std::nothrow) char[fullpathlen + 1];
+            char *rpath = new (std::nothrow) char[rpathlen + 1];
+            snprintf(fullpath, fullpathlen + 1, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            snprintf(rpath, rpathlen + 1, "%s/r/%.128s", rootpath, sha);
+            if (access(rpath, F_OK) != 0)
+            {
+                fclose(fopen(rpath, "w"));
+                chmod(fullpath, 0000);
+                char q[256] = {};
+                sprintf(q, "insert into `upload` values('%.128s', 0, %lld, 'pending')", sha, filesz);
+                create_query_result(logname, mysql, q, false);
+            }
+            unlink(fullpath);
+            symlink(rpath, fullpath);
+            rear->size = 32;
+            memcpy(rear->buf, "upload", strlen("upload"));
+            memcpy(rear->buf + 16, "pending", strlen("pending"));
+            delete[] fullpath;
+            delete[] rpath;
+        }
+        else
+            construct_msg(rear, MSG_NSESS);
+    }
+    else if (STR_EQ(raw, "upready"))
+    {
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        const char *sha = raw + 16;
+        char q[256] = {0};
+        sprintf(q, "select `begin`, `end` from `upload` \
+            where `fileid` = '%.128s' and `status` = 'pending'",
+                sha);
+        MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(res);
+        rear->size = 48;
+        memcpy(rear->buf, "upready", strlen("upready"));
+        if (row)
+        {
+            const size_t b = strtoull(row[0], NULL, 10), e = strtoull(row[1], NULL, 10);
+            snprintf(rear->buf + 16, 16, "%llu", b);
+            size_t sz = e - b + 1;
+            if (sz > MSG_BUF_SZ - 176)
+            {
+                sz = MSG_BUF_SZ - 176;
+                sprintf(q, "insert into `upload` values('%.128s', %llu, %llu, 'uploading')",
+                        sha, b, b + sz - 1);
+                create_query_result(logname, mysql, q, false);
+                sprintf(q, "update `upload` set `begin` = %llu \
+                    where `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
+                        b + sz, sha, b, e);
+                create_query_result(logname, mysql, q, false);
+            }
+            else
+            {
+                sprintf(q, "update `upload` set `status` = 'uploading' \
+                    where `fileid` = %.128s and `begin` = %llu and `end` = %llu",
+                        sha, b, e);
+                create_query_result(logname, mysql, q, false);
+            }
+            snprintf(rear->buf + 32, 16, "%llu", sz);
+            char q[256] = {0};
+        }
+        else
+        {
+            snprintf(rear->buf + 16, 16, "%llu", 0);
+            snprintf(rear->buf + 32, 16, "%llu", 0);
+        }
+        mysql_free_result(res);
+    }
+    else if (STR_EQ("updata", raw))
+    {
+        const char *sha = raw + 16, *off_str = sha + 128,
+                   *len_str = off_str + 16, *data = len_str + 16;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        if (off_str[15] || off_str[0] > '9' || off_str[0] < '0' ||
+            len_str[15] || len_str[0] > '9' || len_str[0] < '0')
+            return construct_msg(rear, MSG_UNREC);
+        const size_t offset = strtoull(off_str, NULL, 10), len = strtoull(len_str, NULL, 10);
+        char q[256] = {0};
+        if (offset >= 0 && len > 0)
+        {
+            size_t b = offset, e = offset + len - 1;
+            sprintf(q, "select `begin` from `upload` \
+                where `fileid` = '%.128s' and `begin` = %llu \
+                and `end` = %llu and `status` = 'uploading'",
+                    sha, b, e);
+            MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+            if (mysql_fetch_row(res) == NULL)
+                return construct_msg(rear, MSG_NUPLD);
+            mysql_free_result(res);
+            int l = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
+            char *fullpath = new (std::nothrow) char[l + 1];
+            snprintf(fullpath, l + 1, "%s/r/%.128s", rootpath, sha);
+            FILE *fp = fopen(fullpath, "rb+");
+            fseek(fp, offset, SEEK_SET);
+            fwrite(data, 1, len, fp);
+            fclose(fp);
+            size_t newb = b, newe = e;
+            while (true)
+            {
+                sprintf(q, "select `begin`, `end` from `upload` where \
+                    `fileid` = '%.128s' and `begin` < %llu and `end` >= %llu and `status` = 'done'",
+                        sha, newb, newb - 1);
+                MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+                MYSQL_ROW row = mysql_fetch_row(res);
+                if (row)
+                {
+                    size_t leftb = strtoull(row[0], NULL, 10), lefte = strtoull(row[1], NULL, 10);
+                    sprintf(q, "delete from `upload` where \
+                        `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
+                            sha, leftb, lefte);
+                    create_query_result(logname, mysql, q, false);
+                    newb = leftb;
+                }
+                else
+                    break;
+                mysql_free_result(res);
+            }
+            while (true)
+            {
+                sprintf(q, "select `begin`, `end` from `upload` where \
+                    `fileid` = '%.128s' and `begin` <= %llu and `end` > %llu and `status` = 'done'",
+                        sha, newe + 1, newe);
+                MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+                MYSQL_ROW row = mysql_fetch_row(res);
+                if (row)
+                {
+                    size_t rightb = strtoull(row[0], NULL, 10), righte = strtoull(row[1], NULL, 10);
+                    sprintf(q, "delete from `upload` where \
+                        `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
+                            sha, rightb, righte);
+                    create_query_result(logname, mysql, q, false);
+                    newe = righte;
+                }
+                else
+                    break;
+                mysql_free_result(res);
+            }
+            sprintf(q, "update `upload` set `status` = 'done', `begin` = %llu, `end` = %llu \
+                where `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
+                    newb, newe, sha, b, e);
+            create_query_result(logname, mysql, q, false);
+            sprintf(q, "select `status` from `upload` where `fileid` = '%.128s'", sha);
+            res = create_query_result(logname, mysql, q, true);
+            if (mysql_num_rows(res) == 1 && strcmp(mysql_fetch_row(res)[0], "done") == 0)
+            {
+                chmod(fullpath, 0644);
+                sprintf(q, "delete from `upload` where `fileid` = %.128s", sha);
+                create_query_result(logname, mysql, q, false);
+            }
+            mysql_free_result(res);
+            delete[] fullpath;
+        }
+        rear->size = 32;
+        memcpy(rear->buf, "updata", 16);
+        int l = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
+        char *fullpath = new (std::nothrow) char[l + 1];
+        snprintf(fullpath, l + 1, "%s/r/%.128s", rootpath, sha);
+        if (mode_bits(fullpath) & S_IREAD)
+            memcpy(rear->buf + 16, "done", strlen("done"));
+        else
+            memcpy(rear->buf + 16, "pending", strlen("pending"));
+        delete[] fullpath;
+    }
     else
     {
-        rear = rear->next = new write_queue_t;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = sock;
-        rear->next = NULL;
         memset(rear->buf, 0, sizeof(rear->buf));
         construct_msg(rear, MSG_UNREC);
     }

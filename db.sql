@@ -17,8 +17,8 @@ create table `invcode` (
 
 create table `user` (
     `userid` char(16) not null,
-    `username` char(16) not null unique,
-    `passwd` varchar(64) not null,
+    `username` varchar(64) not null unique,
+    `passwd` char(64) not null, -- SHA256
     `invcode` char(8) not null,
     primary key (`userid`),
     constraint fk_user_invcode
@@ -41,6 +41,18 @@ create table `login` (
     constraint fk_login_user
         foreign key (`userid`) references `user`(`userid`)
         on delete cascade on update cascade
+);
+
+create table `upload` (
+    `fileid` char(128) not null, -- SHA512
+    `begin` bigint not null,
+    `end` bigint not null,
+    `status` varchar(16) not null default 'pending',
+    primary key (`fileid`, `begin`, `end`),
+    check (`end` > `begin`),
+    check (`status` = 'pending' or
+        `status` = 'uploading' or
+        `status` = 'done')
 );
 
 delimiter -;
