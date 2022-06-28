@@ -13,6 +13,9 @@ The arguments are listed below:
 - `logname LOGPATH`: [Option] Record log in LOGPATH.
 - `--help`: [Option] Show instructions.
 
+Before running, some dynamic linked libraries are required. It can be compiled from `common` directory.
+Another option is modifying `common/makefile` and link them statically.
+
 ## Data format definition
 
 TCP socket between server and client can receive messages from both side and send to the other side.

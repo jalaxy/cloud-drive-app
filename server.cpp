@@ -115,7 +115,7 @@ int mode_bits(const char *filepath)
 {
     struct stat s;
     if (stat(filepath, &s) == -1)
-        return -1;
+        return 0;
     return s.st_mode;
 }
 
