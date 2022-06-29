@@ -24,6 +24,8 @@
 #define MSG_UNREC "Unrecognizable data format."
 #define MSG_TOOLRG "Request exceeds size limits."
 #define MSG_NUPLD "Unrequested upload data."
+#define MSG_ECREAT "Unable to create file."
+#define MSG_WSHA "Wrong hash value."
 
 #define STR_EQ(s, sref) (strncmp(s, sref, strlen(sref)) == 0)
 
@@ -95,12 +97,31 @@ const char *newsid(const char *logname, MYSQL *mysql, char *sid)
 
 void sha512sum(const char *path, char *res)
 {
-    char *cmd = new (std::nothrow) char[snprintf(NULL, 0, "sha512sum %s", path) + 1];
-    sprintf(cmd, "sha512sum %s", path);
+    char *cmd = new (std::nothrow) char[snprintf(NULL, 0, "sha512sum '%s'", path) + 1];
+    sprintf(cmd, "sha512sum '%s'", path);
     FILE *fp = popen(cmd, "r");
     fscanf(fp, "%s", res);
     pclose(fp);
     delete[] cmd;
+}
+
+void rremove(const char *path)
+{
+    char *cmd = new (std::nothrow) char[snprintf(NULL, 0, "rm -rf %s", path) + 1];
+    sprintf(cmd, "rm -rf '%s'", path);
+    FILE *fp = popen(cmd, "r");
+    pclose(fp);
+    delete[] cmd;
+}
+
+bool sha512valid(const char *sha)
+{
+    for (const char *p = sha; p < sha + 128; p++)
+        if (!((*p <= '9' && *p >= '0') ||
+              (*p <= 'F' && *p >= 'A') ||
+              (*p <= 'f' && *p >= 'a')))
+            return false;
+    return true;
 }
 
 int construct_msg(write_queue_t *p, const char *msg)
@@ -124,6 +145,7 @@ int processincoming(
     MYSQL *mysql, const char *raw,
     write_queue_t *rear, sock_inet_base *sock)
 {
+    LOGTIME(logname, "Get request '%.16s'\n", raw);
     if (STR_EQ(raw, "login"))
     {
         const char *username = raw + 16, *passwd = username + 64;
@@ -312,24 +334,45 @@ int processincoming(
             char *rpath = new (std::nothrow) char[rpathlen + 1];
             snprintf(fullpath, fullpathlen + 1, "%s/%s%.*s", rootpath, uid, pathlen, path);
             snprintf(rpath, rpathlen + 1, "%s/r/%.128s", rootpath, sha);
-            if (access(rpath, F_OK) != 0)
+            if (sha512valid(sha))
             {
-                fclose(fopen(rpath, "w"));
-                chmod(fullpath, 0000);
-                char q[256] = {};
-                sprintf(q, "insert into `upload` values('%.128s', 0, %lld, 'pending')", sha, filesz);
-                create_query_result(logname, mysql, q, false);
+                FILE *fp;
+                bool suc = access(rpath, F_OK) == 0;
+                if (!suc && (fp = fopen(rpath, "w")))
+                {
+                    suc = true;
+                    fclose(fp);
+                    chmod(rpath, 0000);
+                    char q[256] = {};
+                    sprintf(q, "insert into `upload` values('%.128s', 0, %lld, 'pending')",
+                            sha, filesz - 1);
+                    create_query_result(logname, mysql, q, false);
+                }
+                if (suc)
+                    unlink(fullpath);
+                if (suc && symlink(rpath, fullpath) == 0)
+                {
+                    rear->size = 32;
+                    memcpy(rear->buf, "upload", strlen("upload"));
+                    memcpy(rear->buf + 16, "pending", strlen("pending"));
+                }
+                else
+                    construct_msg(rear, MSG_ECREAT);
             }
-            unlink(fullpath);
-            symlink(rpath, fullpath);
-            rear->size = 32;
-            memcpy(rear->buf, "upload", strlen("upload"));
-            memcpy(rear->buf + 16, "pending", strlen("pending"));
+            else if (mkdir(fullpath, 0755) == -1)
+                construct_msg(rear, MSG_ECREAT);
+            else
+            {
+                rear->size = 32;
+                memcpy(rear->buf, "upload", strlen("upload"));
+                memcpy(rear->buf + 16, "pending", strlen("pending"));
+            }
             delete[] fullpath;
             delete[] rpath;
         }
         else
             construct_msg(rear, MSG_NSESS);
+        mysql_free_result(res);
     }
     else if (STR_EQ(raw, "upready"))
     {
@@ -419,14 +462,55 @@ int processincoming(
             mysql_free_result(res);
             delete[] fullpath;
         }
-        rear->size = 32;
-        memcpy(rear->buf, "updata", 16);
         int l = snprintf(NULL, 0, "%s/r/%.128s", rootpath, sha);
         char *fullpath = new (std::nothrow) char[l + 1];
         snprintf(fullpath, l + 1, "%s/r/%.128s", rootpath, sha);
         bool readable = mode_bits(fullpath) & S_IREAD;
-        memcpy(rear->buf + 16, readable ? "done" : "pending", strlen(readable ? "done" : "pending"));
+        char realsha[128];
+        if (readable)
+            sha512sum(fullpath, realsha);
+        if (readable && strncmp(sha, realsha, 128) != 0)
+        {
+            construct_msg(rear, MSG_WSHA);
+            remove(fullpath);
+        }
+        else
+        {
+            rear->size = 32;
+            memcpy(rear->buf, "updata", 16);
+            memcpy(rear->buf + 16, readable ? "done" : "pending",
+                   strlen(readable ? "done" : "pending"));
+        }
         delete[] fullpath;
+    }
+    else if (STR_EQ(raw, "delete"))
+    {
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
+        const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
+        if (pathlenstr[15] || pathlenstr[0] > '9' || pathlenstr[0] < '0')
+            return construct_msg(rear, MSG_UNREC);
+        const long pathlen = strtol(pathlenstr, NULL, 10);
+        char q[256] = {0};
+        sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
+        MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (row)
+        {
+            const char *uid = row[0];
+            int fullpathlen = snprintf(NULL, 0, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            char *fullpath = new (std::nothrow) char[fullpathlen + 1];
+            snprintf(fullpath, fullpathlen + 1, "%s/%s%.*s", rootpath, uid, pathlen, path);
+            rremove(fullpath);
+            delete[] fullpath;
+            rear->size = 32;
+            memcpy(rear->buf, "delete", strlen("delete"));
+            memcpy(rear->buf + 16, "success", strlen("success"));
+        }
+        else // session not found
+            construct_msg(rear, MSG_NSESS);
+        mysql_free_result(res);
     }
     else
     {
