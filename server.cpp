@@ -15,17 +15,17 @@
 #define SOCK_BUF_SZ (1024 * 16)
 #define MSG_BUF_SZ (1024 * 1024)
 
-#define MSG_NOUSER "ÓÃ»§²»´æÔÚ"
-#define MSG_WPSWD "ÃÜÂë´íÎó"
-#define MSG_WINV "ÑûÇëÂë´íÎó"
-#define MSG_UEXST "ÓÃ»§ÒÑ´æÔÚ"
-#define MSG_NFILE "ÎÄ¼şÎ´ÕÒµ½"
-#define MSG_NSESS "»á»°²»´æÔÚ"
-#define MSG_UNREC "Î´Öª¸ñÊ½"
-#define MSG_TOOLRG "´óĞ¡³¬ÏŞ"
-#define MSG_NUPLD "Î´ÉêÇëÉÏ´«"
-#define MSG_ECREAT "ÎŞ·¨´´½¨"
-#define MSG_WSHA "É¢ÁĞÖµ´íÎó"
+#define MSG_NOUSER "ç”¨æˆ·ä¸å­˜åœ¨"
+#define MSG_WPSWD "å¯†ç é”™è¯¯"
+#define MSG_WINV "é‚€è¯·ç é”™è¯¯"
+#define MSG_UEXST "ç”¨æˆ·å·²å­˜åœ¨"
+#define MSG_NFILE "æ–‡ä»¶æœªæ‰¾åˆ°"
+#define MSG_NSESS "ä¼šè¯ä¸å­˜åœ¨"
+#define MSG_UNREC "æœªçŸ¥æ ¼å¼"
+#define MSG_TOOLRG "å¤§å°è¶…é™"
+#define MSG_NUPLD "æœªç”³è¯·ä¸Šä¼ "
+#define MSG_ECREAT "æ— æ³•åˆ›å»º"
+#define MSG_WSHA "æ•£åˆ—å€¼é”™è¯¯"
 
 #define STR_EQ(s, sref) (strncmp(s, sref, strlen(sref)) == 0)
 
@@ -107,10 +107,11 @@ void sha512sum(const char *path, char *res)
     delete[] cmd;
 }
 
-void rremove(const char *path)
+void filecmd(const char *command, const char *path, const char *newpath)
 {
-    char *cmd = new (std::nothrow) char[snprintf(NULL, 0, "rm -rf %s", path) + 1];
-    sprintf(cmd, "rm -rf '%s'", path);
+    int len = snprintf(NULL, 0, "%s %s %s", command, path, newpath ? newpath : "");
+    char *cmd = new (std::nothrow) char[len + 1];
+    snprintf(cmd, len + 1, "%s %s %s", command, path, newpath ? newpath : "");
     FILE *fp = popen(cmd, "r");
     pclose(fp);
     delete[] cmd;
@@ -191,17 +192,26 @@ int processincoming(
         if (row && strtol(row[0], NULL, 10) < strtol(row[1], NULL, 10))
         {
             rear->size = 144;
-            char qinsert[128] = {0};
-            sprintf(qinsert, "select username from user where `username` = '%.64s';", username);
-            MYSQL_RES *rinsert = create_query_result(logname, mysql, qinsert, true);
+            char q[128] = {0};
+            sprintf(q, "select username from user where `username` = '%.64s';", username);
+            MYSQL_RES *rinsert = create_query_result(logname, mysql, q, true);
             if (mysql_fetch_row(rinsert))
                 construct_msg(rear, MSG_UEXST);
             else
             {
-                sprintf(qinsert, "insert into `user`(`username`, `passwd`, `invcode`) \
+                sprintf(q, "insert into `user`(`username`, `passwd`, `invcode`) \
                     values ('%s', '%s', '%s');",
                         username, passwd, invcode);
-                create_query_result(logname, mysql, qinsert, false);
+                create_query_result(logname, mysql, q, false);
+                sprintf(q, "select `userid` from `last`");
+                MYSQL_RES *res = create_query_result(logname, mysql, q, true);
+                MYSQL_ROW row = mysql_fetch_row(res);
+                int dirlen = snprintf(NULL, 0, "%s/%s", rootpath, row[0]);
+                char *newdir = new (std::nothrow) char[dirlen + 1];
+                snprintf(newdir, dirlen + 1, "%s/%s", rootpath, row[0]);
+                mkdir(newdir, 0755);
+                delete[] newdir;
+                mysql_free_result(res);
                 memcpy(rear->buf, "register", strlen("register"));
                 memcpy(rear->buf + 16, "Success.", strlen("Success."));
             }
@@ -523,8 +533,9 @@ int processincoming(
         }
         delete[] fullpath;
     }
-    else if (STR_EQ(raw, "delete"))
+    else if (STR_EQ(raw, "delete") || STR_EQ(raw, "copy") || STR_EQ(raw, "move"))
     {
+        const bool longdata = STR_EQ(raw, "copy") || STR_EQ(raw, "move");
         if (p->buflen < 160)
             return -1;
         const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
@@ -538,6 +549,23 @@ int processincoming(
         const long pathlen = strtol(pathlenstr, NULL, 10);
         if (p->buflen < 160 + pathlen)
             return -1;
+        const char *newlenstr = path + pathlen, *newpath = newlenstr + 16;
+        long newlen;
+        if (longdata)
+        {
+            if (p->buflen < 176 + pathlen)
+                return -1;
+            if (newlenstr[15] || newlenstr[0] > '9' || newlenstr[0] < '0')
+            {
+                (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+                rear->sock = p->sock;
+                memset(rear->buf, 0, sizeof(rear->buf));
+                return construct_msg(rear, MSG_UNREC);
+            }
+            newlen = strtol(newlenstr, NULL, 10);
+            if (p->buflen < 176 + pathlen + newlen)
+                return -1;
+        }
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
         rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
@@ -551,10 +579,23 @@ int processincoming(
             int fullpathlen = snprintf(NULL, 0, "%s/%s%.*s", rootpath, uid, pathlen, path);
             char *fullpath = new (std::nothrow) char[fullpathlen + 1];
             snprintf(fullpath, fullpathlen + 1, "%s/%s%.*s", rootpath, uid, pathlen, path);
-            rremove(fullpath);
+            int fullnewlen;
+            char *fullnewpath;
+            if (longdata)
+            {
+                fullnewlen = snprintf(NULL, 0, "%s/%s%.*s", rootpath, uid, newlen, newpath);
+                fullnewpath = new (std::nothrow) char[fullnewlen + 1];
+                snprintf(fullnewpath, fullnewlen + 1, "%s/%s%.*s", rootpath, uid, newlen, newpath);
+            }
+            else
+                fullnewpath = NULL;
+            const char *cmd = STR_EQ(raw, "delete") ? "rm -rf" : (STR_EQ(raw, "copy") ? "cp -r" : "mv -f");
+            filecmd(cmd, fullpath, fullnewpath);
             delete[] fullpath;
+            if (longdata)
+                delete[] fullnewpath;
             rear->size = 32;
-            memcpy(rear->buf, "delete", strlen("delete"));
+            memcpy(rear->buf, raw, longdata ? 4 : 6);
             memcpy(rear->buf + 16, "success", strlen("success"));
         }
         else // session not found
