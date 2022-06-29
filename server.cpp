@@ -15,17 +15,17 @@
 #define SOCK_BUF_SZ (1024 * 16)
 #define MSG_BUF_SZ (1024 * 1024)
 
-#define MSG_NOUSER "User does not exist."
-#define MSG_WPSWD "Incorrect password."
-#define MSG_WINV "Invalid invitation code."
-#define MSG_UEXST "User already exists."
-#define MSG_NFILE "File not found."
-#define MSG_NSESS "Session not found."
-#define MSG_UNREC "Unrecognizable data format."
-#define MSG_TOOLRG "Request exceeds size limits."
-#define MSG_NUPLD "Unrequested upload data."
-#define MSG_ECREAT "Unable to create file."
-#define MSG_WSHA "Wrong hash value."
+#define MSG_NOUSER "用户不存在"
+#define MSG_WPSWD "密码错误"
+#define MSG_WINV "邀请码错误"
+#define MSG_UEXST "用户已存在"
+#define MSG_NFILE "文件未找到"
+#define MSG_NSESS "会话不存在"
+#define MSG_UNREC "未知格式"
+#define MSG_TOOLRG "大小超限"
+#define MSG_NUPLD "未申请上传"
+#define MSG_ECREAT "无法创建"
+#define MSG_WSHA "散列值错误"
 
 #define STR_EQ(s, sref) (strncmp(s, sref, strlen(sref)) == 0)
 
@@ -33,6 +33,8 @@ typedef struct struct_sock_list
 {
     sock_inet_base *sock;
     struct struct_sock_list *next;
+    char buf[MSG_BUF_SZ];
+    int buflen;
 } sock_list_t;
 
 typedef struct struct_write_queue
@@ -141,16 +143,17 @@ int mode_bits(const char *filepath)
 }
 
 int processincoming(
-    const char *logname, const char *rootpath,
-    MYSQL *mysql, const char *raw,
-    write_queue_t *rear, sock_inet_base *sock)
+    const char *logname, const char *rootpath, MYSQL *mysql, write_queue_t *rear, sock_list_t *p)
 {
+    const char *raw = p->buf;
     LOGTIME(logname, "Get request '%.16s'\n", raw);
     if (STR_EQ(raw, "login"))
     {
+        if (p->buflen < 144)
+            return -1;
         const char *username = raw + 16, *passwd = username + 64;
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
+        rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
         char q[128] = {0};
         sprintf(q, "select `userid`, `passwd` from user where `username` = '%.64s';", username);
@@ -174,9 +177,11 @@ int processincoming(
     }
     else if (STR_EQ(raw, "register"))
     {
+        if (p->buflen < 152)
+            return -1;
         const char *username = raw + 16, *passwd = username + 64, *invcode = passwd + 64;
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
+        rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
         char q[128] = {0};
         sprintf(q, "select count(*), maxnum from `invcode` natural join `user` where `invcode` = '%.8s'",
@@ -208,13 +213,22 @@ int processincoming(
     }
     else if (STR_EQ(raw, "download"))
     {
-        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
-        memset(rear->buf, 0, sizeof(rear->buf));
+        if (p->buflen < 160)
+            return -1;
         const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
         if (pathlenstr[15] || pathlenstr[0] > '9' || pathlenstr[0] < '0')
+        {
+            (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+            rear->sock = p->sock;
+            memset(rear->buf, 0, sizeof(rear->buf));
             return construct_msg(rear, MSG_UNREC);
+        }
         const long pathlen = strtol(pathlenstr, NULL, 10);
+        if (p->buflen < 160 + pathlen)
+            return -1;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = p->sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
         char q[256] = {0};
         sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
         MYSQL_RES *res = create_query_result(logname, mysql, q, true);
@@ -282,9 +296,11 @@ int processincoming(
     }
     else if (STR_EQ(raw, "downdata"))
     {
+        if (p->buflen < 176)
+            return -1;
         const char *sha = raw + 16, *off_str = sha + 128, *len_str = off_str + 16;
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
+        rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
         if (off_str[15] || off_str[0] > '9' || off_str[0] < '0' ||
             len_str[15] || len_str[0] > '9' || len_str[0] < '0')
@@ -312,15 +328,24 @@ int processincoming(
     }
     else if (STR_EQ(raw, "upload"))
     {
+        if (p->buflen < 304)
+            return -1;
         const char *sid = raw + 16, *sha = sid + 128, *filesz_str = sha + 128,
                    *pathlen_str = filesz_str + 16, *path = pathlen_str + 16;
-        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
-        memset(rear->buf, 0, sizeof(rear->buf));
         if (filesz_str[15] || filesz_str[0] > '9' || filesz_str[0] < '0' ||
             pathlen_str[15] || pathlen_str[0] > '9' || pathlen_str[0] < '0')
+        {
+            (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+            rear->sock = p->sock;
+            memset(rear->buf, 0, sizeof(rear->buf));
             return construct_msg(rear, MSG_UNREC);
+        }
         const size_t filesz = strtoull(filesz_str, NULL, 10), pathlen = strtoull(pathlen_str, NULL, 10);
+        if (p->buflen < 304 + pathlen)
+            return -1;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = p->sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
         char q[256] = {0};
         sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
         MYSQL_RES *res = create_query_result(logname, mysql, q, true);
@@ -354,7 +379,10 @@ int processincoming(
                 {
                     rear->size = 32;
                     memcpy(rear->buf, "upload", strlen("upload"));
-                    memcpy(rear->buf + 16, "pending", strlen("pending"));
+                    if (mode_bits(rpath) & S_IREAD)
+                        memcpy(rear->buf + 16, "done", strlen("done"));
+                    else
+                        memcpy(rear->buf + 16, "pending", strlen("pending"));
                 }
                 else
                     construct_msg(rear, MSG_ECREAT);
@@ -376,8 +404,10 @@ int processincoming(
     }
     else if (STR_EQ(raw, "upready"))
     {
+        if (p->buflen < 144)
+            return -1;
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
+        rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
         const char *sha = raw + 16;
         char q[256] = {0};
@@ -407,7 +437,7 @@ int processincoming(
             else
             {
                 sprintf(q, "update `upload` set `status` = 'uploading' \
-                    where `fileid` = %.128s and `begin` = %llu and `end` = %llu",
+                    where `fileid` = '%.128s' and `begin` = %llu and `end` = %llu",
                         sha, b, e);
                 create_query_result(logname, mysql, q, false);
             }
@@ -423,15 +453,25 @@ int processincoming(
     }
     else if (STR_EQ("updata", raw))
     {
+        if (p->buflen < 176)
+            return -1;
         const char *sha = raw + 16, *off_str = sha + 128,
                    *len_str = off_str + 16, *data = len_str + 16;
-        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
-        memset(rear->buf, 0, sizeof(rear->buf));
         if (off_str[15] || off_str[0] > '9' || off_str[0] < '0' ||
             len_str[15] || len_str[0] > '9' || len_str[0] < '0')
+        {
+            (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+            rear->sock = p->sock;
+            memset(rear->buf, 0, sizeof(rear->buf));
             return construct_msg(rear, MSG_UNREC);
+        }
         const size_t offset = strtoull(off_str, NULL, 10), len = strtoull(len_str, NULL, 10);
+        LOGTIME(logname, "%d %d %.16s\n", p->buflen, len, len_str);
+        if (p->buflen < 176 + len)
+            return -1;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = p->sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
         char q[256] = {0};
         if (offset >= 0 && len > 0)
         {
@@ -485,13 +525,22 @@ int processincoming(
     }
     else if (STR_EQ(raw, "delete"))
     {
-        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
-        memset(rear->buf, 0, sizeof(rear->buf));
+        if (p->buflen < 160)
+            return -1;
         const char *sid = raw + 16, *pathlenstr = sid + 128, *path = pathlenstr + 16;
         if (pathlenstr[15] || pathlenstr[0] > '9' || pathlenstr[0] < '0')
+        {
+            (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+            rear->sock = p->sock;
+            memset(rear->buf, 0, sizeof(rear->buf));
             return construct_msg(rear, MSG_UNREC);
+        }
         const long pathlen = strtol(pathlenstr, NULL, 10);
+        if (p->buflen < 160 + pathlen)
+            return -1;
+        (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
+        rear->sock = p->sock;
+        memset(rear->buf, 0, sizeof(rear->buf));
         char q[256] = {0};
         sprintf(q, "select `userid` from `login` where `sessionid` = '%.128s'", sid);
         MYSQL_RES *res = create_query_result(logname, mysql, q, true);
@@ -515,7 +564,7 @@ int processincoming(
     else
     {
         (rear = rear->next = new (std::nothrow) write_queue_t)->next = NULL;
-        rear->sock = sock;
+        rear->sock = p->sock;
         memset(rear->buf, 0, sizeof(rear->buf));
         construct_msg(rear, MSG_UNREC);
     }
@@ -566,7 +615,7 @@ int main(int argc, char *argv[])
     socklsn.set_epoll(epfd, 1);
 
     // socket list and buffer queue initialization
-    sock_list_t head = {NULL, NULL};
+    sock_list_t head = {NULL, NULL, {0}, 0};
     write_queue_t front = {0, {0}, NULL, NULL}, *rear = &front;
 
     // signals
@@ -603,6 +652,8 @@ int main(int argc, char *argv[])
                     p->next = head.next;
                     head.next = p; // link into list
                     p->sock->set_epoll(epfd, EPOLL_CTL_ADD);
+                    memset(p->buf, 0, sizeof(p->buf));
+                    p->buflen = 0;
                 }
             else // normal data I/O socket
             {
@@ -618,7 +669,14 @@ int main(int argc, char *argv[])
                     int size;
                     IGNORE_ERR(size = p->sock->recv_data(buf, SOCK_BUF_SZ));
                     if (size > 0)
-                        processincoming(logname, rootpath, mysql, buf, rear, p->sock);
+                    {
+                        if (p->buflen + size > MSG_BUF_SZ)
+                            memset(p->buf, 0, sizeof(buf)), p->buflen = 0;
+                        memcpy(p->buf + p->buflen, buf, size);
+                        p->buflen += size;
+                        if (processincoming(logname, rootpath, mysql, rear, p) == 0)
+                            memset(p->buf, 0, sizeof(p->buf)), p->buflen = 0;
+                    }
                     else
                     {
                         // connection is closed by any side of connection
