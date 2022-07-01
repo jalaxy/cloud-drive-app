@@ -81,6 +81,5 @@ begin
 end-;
 delimiter ;
 
-insert into `invcode` values ('00000000', 2);
--- insert into `user`(`username`, `passwd`, `invcode`) values('test', sha2('123', 256), '00000000');
-insert into `user`(`username`, `passwd`, `invcode`) values('test', '123', '00000000');
+insert into `invcode` values ('00000000', 100);
+insert into `user`(`username`, `passwd`, `invcode`) values('test', sha2('123', 256), '00000000');

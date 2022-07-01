@@ -162,17 +162,24 @@ int processincoming(
         MYSQL_ROW row = mysql_fetch_row(result);
         if (!row)
             construct_msg(rear, MSG_NOUSER);
-        else if (strncmp(row[1], passwd, 64) != 0)
-            construct_msg(rear, MSG_WPSWD);
         else
         {
-            char sid[129];
-            rear->size = 144;
-            memcpy(rear->buf, "login", strlen("login"));
-            memcpy(rear->buf + 16, newsid(logname, mysql, sid), 128);
-            char qinsert[128] = {0};
-            sprintf(qinsert, "insert into `login` values('%.128s', '%.16s');", sid, row[0]);
-            create_query_result(logname, mysql, qinsert, false);
+            sprintf(q, "select sha2('%s', 256);", passwd);
+            MYSQL_RES *res2 = create_query_result(logname, mysql, q, true);
+            MYSQL_ROW row2 = mysql_fetch_row(res2);
+            if (strncmp(row[1], row2[0], 64) != 0)
+                construct_msg(rear, MSG_WPSWD);
+            else
+            {
+                char sid[129];
+                rear->size = 144;
+                memcpy(rear->buf, "login", strlen("login"));
+                memcpy(rear->buf + 16, newsid(logname, mysql, sid), 128);
+                char qinsert[128] = {0};
+                sprintf(qinsert, "insert into `login` values('%.128s', '%.16s');", sid, row[0]);
+                create_query_result(logname, mysql, qinsert, false);
+            }
+            mysql_free_result(res2);
         }
         mysql_free_result(result);
     }
@@ -200,7 +207,7 @@ int processincoming(
             else
             {
                 sprintf(q, "insert into `user`(`username`, `passwd`, `invcode`) \
-                    values ('%s', '%s', '%s');",
+                    values ('%s', sha2('%s', 256), '%s');",
                         username, passwd, invcode);
                 create_query_result(logname, mysql, q, false);
                 sprintf(q, "select `userid` from `last`");
@@ -209,7 +216,7 @@ int processincoming(
                 int dirlen = snprintf(NULL, 0, "%s/%s", rootpath, row[0]);
                 char *newdir = new (std::nothrow) char[dirlen + 1];
                 snprintf(newdir, dirlen + 1, "%s/%s", rootpath, row[0]);
-                mkdir(newdir, 0755);
+                mkdir(newdir, 0777);
                 delete[] newdir;
                 mysql_free_result(res);
                 memcpy(rear->buf, "register", strlen("register"));
@@ -397,7 +404,7 @@ int processincoming(
                 else
                     construct_msg(rear, MSG_ECREAT);
             }
-            else if (mkdir(fullpath, 0755) == -1)
+            else if (mkdir(fullpath, 0777) == -1)
                 construct_msg(rear, MSG_ECREAT);
             else
             {
@@ -508,7 +515,7 @@ int processincoming(
             sprintf(q, "select `status` from `upload` where `fileid` = '%.128s'", sha);
             res = create_query_result(logname, mysql, q, true);
             if (mysql_num_rows(res) == 0)
-                chmod(fullpath, 0644);
+                chmod(fullpath, 0666);
             mysql_free_result(res);
             delete[] fullpath;
         }
